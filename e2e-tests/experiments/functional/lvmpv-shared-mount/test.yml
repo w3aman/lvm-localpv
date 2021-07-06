@@ -54,6 +54,19 @@
             delay: 2
             retries: 20
 
+          - name: Get the pvc size
+            shell: >
+              kubectl get pvc {{ app_pvc }} -n {{ app_ns }} --no-headers -o custom-columns=:.status.capacity.storage
+            args:
+              executable: /bin/bash
+            register: storage_capacity
+
+          - name: Fetch the value string after removing alphabet(G,M,m,g) from storage capacity
+            shell: echo "{{ storage_capacity.stdout }}" | grep -o -E '[0-9]+'
+            args:
+              executable: /bin/bash
+            register: value_str
+
           - name: Get the application deployment name
             shell: >
               kubectl get deploy -n {{ app_ns }} --no-headers -o custom-columns=:.metadata.name
@@ -148,6 +161,28 @@
               label: name=share-pod
               pod_name: "{{ app_pod_name.stdout }}"
 
+          - name: Record the desired volume size to be updated
+            set_fact:
+              desired_vol: '{{ (value_str.stdout | int * 2 | int) | int }}'
+
+          - name: Resize the volume
+            shell: >
+              kubectl patch pvc {{ app_pvc }} -n {{ app_ns }} -p '{"spec":{"resources":{"requests":{"storage":"{{ desired_vol }}Gi"}}}}'
+            args:
+              executable: /bin/bash
+            register: resize_status
+            failed_when: "resize_status.rc != 0"
+
+          - name: Verify that pvc has been resized successfully
+            shell: >
+              kubectl get pvc {{ app_pvc }} -n {{ app_ns }} --no-headers -o custom-columns=:.status.capacity.storage
+            args:
+              executable: /bin/bash
+            register: updated_pvc_size
+            until: "desired_vol in updated_pvc_size.stdout"
+            delay: 3
+            retries: 45     
+
           - name: Delete the dumped data files from scaled application pod
             shell: >
               kubectl exec -ti {{ scaled_app_pod_name.stdout }} -n {{ app_ns }} -- sh -c
@@ -157,12 +192,30 @@
             register: status
             failed_when: "status.rc != 0"
 
+            ## Here we will dump +1Gi data than to previous pvc size
+          - set_fact:
+              value_num: '{{ ( (value_str.stdout | int + 1 | int) * 262144) |  int }}'
+              
+                          # include_tasks: "/e2e-tests/utils/applications/busybox/busybox_data_persistence.yml"
+            # vars:
+            #   status: 'LOAD'
+            #   ns: "{{ app_ns }}"
+            #   pod_name: "{{ scaled_app_pod_name.stdout }}"
+
+          # - name: Create some test data in the busybox app
+
           - name: Again dumping some dummy data, this time from scaled application pod
-            include_tasks: "/e2e-tests/utils/applications/busybox/busybox_data_persistence.yml"
-            vars:
-              status: 'LOAD'
-              ns: "{{ app_ns }}"
-              pod_name: "{{ scaled_app_pod_name.stdout }}"
+            shell: >
+              kubectl exec {{ scaled_app_pod_name.stdout }} -n {{ app_ns }} 
+              -- sh -c "{{ item }}"
+            args:
+              executable: /bin/bash
+            register: result
+            failed_when: "result.rc != 0"
+            with_items:
+              - "dd if=/dev/urandom of=/busybox/{{ testfile }} bs={{ blocksize }} count={{ value_num }}"
+              - "md5sum /busybox/{{ testfile }} > /busybox/{{ testfile }}-pre-chaos-md5"
+              - "sync;sync;sync"
 
           - name: Get the application master pod name
             shell: >
